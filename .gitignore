@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter — notebooks ARE committed with outputs (the plots are the point),
+# but the checkpoint sidecars are not.
+.ipynb_checkpoints/
+
+# Model artifacts. Trained weights come back from Colab as release assets or a
+# Drive link, never committed — a 100-epoch UNet checkpoint is ~200 MB.
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Scratch
+.DS_Store
+scratch/
+runs/
+wandb/
+
+# NOTE: data/fixtures/*.parquet IS committed on purpose. Colab gets the training
+# data by `git clone`, so the cloud run trains on byte-identical data to the
+# local smoke run. See CLAUDE.md → Data policy.

@@ -1,0 +1,21 @@
+# Core
+torch>=2.10
+numpy>=2.0
+pandas>=2.2
+scipy>=1.14
+
+# Data
+yfinance>=1.2
+pyarrow>=17
+
+# Baselines
+arch>=7.0          # GARCH(1,1)-t
+scikit-learn>=1.5  # discriminative / predictive scores
+
+# Cross-check only — our Haar MODWT is hand-rolled and validated against this
+# once, then never depended on at runtime. See src/diffmodel/wavelet.py.
+PyWavelets>=1.7
+
+# Notebook / UX
+matplotlib>=3.9
+tqdm>=4.66
