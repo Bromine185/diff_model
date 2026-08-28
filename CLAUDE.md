@@ -74,6 +74,7 @@ src/diffmodel/
 notebooks/
   01_wavelet_ddpm.ipynb     primary deliverable
   02_baselines_and_scorecard.ipynb
+  03_colab_full_train.ipynb the FULL run: clone, train on a Colab GPU, take the checkpoint home
 ```
 
 ## Data policy

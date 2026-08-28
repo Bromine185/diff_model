@@ -18,9 +18,11 @@ from diffmodel.ddpm import (
     cosine_beta_schedule,
     linear_beta_schedule,
     p_losses,
+    p_sample_step,
     q_sample,
     sample,
 )
+from diffmodel.seeding import torch_generator
 from diffmodel.unet import UNet
 
 
@@ -46,6 +48,13 @@ def test_schedule_buffers_are_consistent(kind):
     assert torch.allclose(sched.alphas_cumprod_prev[1:], sched.alphas_cumprod[:-1], atol=1e-6)
     # final reverse step is deterministic
     assert sched.posterior_variance[0] == pytest.approx(0.0, abs=1e-9)
+    # posterior-mean coefficients: pushing the ZERO-NOISE forward state
+    # x_t = sqrt(alphabar_t) x0 through the posterior mean must land exactly on
+    # the zero-noise x_{t-1}, i.e. coef1 + coef2 * sqrt(alphabar_t) =
+    # sqrt(alphabar_{t-1}) — an identity that fails if either coefficient is
+    # mis-derived from Ho et al. eq. 7.
+    lhs = sched.posterior_mean_coef1 + sched.posterior_mean_coef2 * sched.sqrt_alphas_cumprod
+    assert torch.allclose(lhs, torch.sqrt(sched.alphas_cumprod_prev), atol=1e-5)
 
 
 def test_short_schedule_warns_that_it_never_reaches_noise():
@@ -74,8 +83,19 @@ def test_linear_schedule_endpoints():
 
 
 def test_cosine_schedule_is_bounded():
-    b = cosine_beta_schedule(1000)
-    assert torch.all(b > 0) and torch.all(b < 1)
+    """Upper clip is 0.999, per Nichol & Dhariwal §3.2 — NOT 0.9999.
+
+    The distinction is load-bearing at small T: the clip caps the reverse step's
+    state gain 1/sqrt(alpha_t) at sqrt(1/0.001) ≈ 31.6. The earlier 0.9999 clip
+    allowed alpha_t = 1e-4, i.e. a 100x gain on the FIRST reverse step, which is
+    what let a merely-inaccurate epsilon predictor blow SMOKE samples up to
+    std ~1.9e3 (RESEARCH.md Phase 4 correction).
+    """
+    for T in (50, 1000):
+        b = cosine_beta_schedule(T)
+        assert torch.all(b > 0) and torch.all(b <= 0.999)
+    # at T=50 the schedule actually saturates the clip, so the bound is exercised
+    assert cosine_beta_schedule(50).max() == pytest.approx(0.999)
 
 
 # --- the forward process --------------------------------------------------
@@ -200,6 +220,130 @@ def test_sampling_is_reproducible_under_a_fixed_seed():
     torch.manual_seed(123)
     b = sample(model, (2, 3, 8, 128), sched, torch.device("cpu"))
     assert torch.equal(a, b)
+
+
+# --- the x0-parameterised reverse step ------------------------------------
+
+def _eps_form_step(model, x, t_index, sched, noise):
+    """Reference implementation: the epsilon-parameterised reverse step.
+
+    mu = 1/sqrt(alpha_t) * (x - beta_t / sqrt(1 - alphabar_t) * eps_theta), the
+    exact update `p_sample_step` ran before it was rewritten in x0-hat form.
+    Kept here as the independent reference the x0-hat form must reproduce: the
+    posterior-mean coefficients c1 = beta_t sqrt(alphabar_{t-1}) / (1 - alphabar_t)
+    and c2 = (1 - alphabar_{t-1}) sqrt(alpha_t) / (1 - alphabar_t) (Ho et al.
+    2020, eq. 7) collapse to this line when x0_hat is substituted unclamped.
+    """
+    t = torch.full((x.shape[0],), t_index, dtype=torch.long)
+    beta = sched.betas[t_index]
+    sqrt_omab = sched.sqrt_one_minus_alphas_cumprod[t_index]
+    sqrt_recip_a = sched.sqrt_recip_alphas[t_index]
+    with torch.no_grad():
+        mean = sqrt_recip_a * (x - beta / sqrt_omab * model(x, t))
+    if t_index == 0:
+        return mean
+    return mean + torch.sqrt(sched.posterior_variance[t_index]) * noise
+
+
+def test_x0_form_step_equals_eps_form_when_unclamped():
+    """x0_clamp=None makes the rewritten step ALGEBRAICALLY the old one.
+
+    Checked at both ends of the chain and in the middle, on the SMOKE schedule
+    (T=50 cosine) where the arithmetic is at its most ill-conditioned — the
+    t=T-1 step divides by sqrt(alphabar_T) ~ 1e-3, so this is also where an
+    algebra slip in c1/c2 would show first.
+    """
+    sched = DiffusionSchedule.build(50, kind="cosine")
+    model = _tiny_model()
+    x = torch.randn(4, 3, 8, 128, generator=torch_generator("x0-eq-state")) * 2.0
+
+    for t_index in (0, 1, 10, 25, 49):
+        label = f"x0-eq-noise-{t_index}"
+        got = p_sample_step(model, x, t_index, sched, x0_clamp=None,
+                            generator=torch_generator(label))
+        noise = torch.randn(x.shape, generator=torch_generator(label))
+        want = _eps_form_step(model, x, t_index, sched, noise)
+        assert torch.allclose(got, want, atol=1e-5), f"forms diverge at t={t_index}"
+
+
+def test_x0_clamp_actually_binds():
+    """With a clamp tight enough to bite, the step must differ from the raw form —
+    otherwise the parameter is decorative and the blow-up fix is imaginary."""
+    sched = DiffusionSchedule.build(50, kind="cosine")
+    model = _tiny_model()
+    # large state at the noisiest step => |x0_hat| = |x| / sqrt(alphabar) >> 1
+    x = torch.randn(2, 3, 8, 128, generator=torch_generator("x0-clamp-state")) * 5.0
+    label = "x0-clamp-noise"
+    clamped = p_sample_step(model, x, 49, sched, x0_clamp=6.5,
+                            generator=torch_generator(label))
+    raw = p_sample_step(model, x, 49, sched, x0_clamp=None,
+                        generator=torch_generator(label))
+    assert not torch.allclose(clamped, raw)
+    assert clamped.abs().max() < raw.abs().max()
+
+
+def test_sample_generator_is_reproducible_without_global_seeding():
+    """Two same-label generators => bit-identical chains, with the global RNG
+    deliberately scrambled differently before each call. This is the property
+    `scripts/run_scorecard.py` used to fake by pinning process-global state."""
+    sched = DiffusionSchedule.build(20, kind="cosine")
+    model = _tiny_model()
+    torch.manual_seed(1)
+    a = sample(model, (2, 3, 8, 128), sched, torch.device("cpu"),
+               generator=torch_generator("sampler-repro"))
+    torch.manual_seed(2)   # different global state; must not matter
+    b = sample(model, (2, 3, 8, 128), sched, torch.device("cpu"),
+               generator=torch_generator("sampler-repro"))
+    assert torch.equal(a, b)
+
+    c = sample(model, (2, 3, 8, 128), sched, torch.device("cpu"),
+               generator=torch_generator("sampler-other-label"))
+    assert not torch.equal(a, c), "different labels must fork different streams"
+
+
+def test_smoke_checkpoint_samples_stay_bounded():
+    """THE regression test for the sampler blow-up.
+
+    The bug: sampling the SMOKE checkpoint produced image-space std ~1.9e3
+    against a real 0.333 — a 6000x explosion that saturated every decoded pixel.
+    The fix (x0_clamp at the data-derived 6.5, beta clip 0.999) does not make a
+    4-epoch model GOOD; it makes it fail BOUNDED, and the bars here are the
+    bounds the MECHANISM guarantees, not sample-quality hopes:
+
+      * the final reverse step returns clamped x0_hat exactly (coef2 is 0 at
+        t=0), so |pixel| <= x0_clamp is a hard ceiling — assert it exactly;
+      * that ceiling caps std at x0_clamp = ~19.5x the real 0.333, so 30x real
+        separates "bounded bad" from "exploded" with margin. Measured on the
+        retrained 4-epoch checkpoint the clamped std is ~4.3 (a weak model
+        railing against the clamp — the expected SMOKE result, recorded in
+        RESEARCH.md Phase 4's correction, not tuned away); the broken sampler
+        missed this bar by two orders of magnitude.
+    """
+    from diffmodel.config import CHECKPOINTS, get_config
+    from diffmodel.pipeline import prepare
+
+    ckpt = CHECKPOINTS / "smoke_latest.pt"
+    if not ckpt.exists():
+        pytest.skip("checkpoints/smoke_latest.pt not present (gitignored; train SMOKE first)")
+
+    cfg = get_config("SMOKE")
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    model = UNet(3, cfg.base_channels, cfg.channel_mults, cfg.num_res_blocks,
+                 cfg.attention_at_bottleneck, dropout=cfg.dropout)
+    model.load_state_dict(ck["ema"], strict=True)
+    model.eval()
+
+    sched = DiffusionSchedule.build(cfg.timesteps, kind=cfg.beta_schedule)
+    out = sample(model, (64, *cfg.image_shape), sched, torch.device("cpu"),
+                 x0_clamp=cfg.x0_clamp, generator=torch_generator("bounded-sample-test"))
+    real_std = prepare(cfg, verbose=False).train_images.std()
+    assert torch.isfinite(out).all()
+    assert out.abs().max().item() <= cfg.x0_clamp + 1e-4, \
+        "the final step must return the clamped x0_hat; the ceiling is exact"
+    assert out.std().item() < 30 * real_std, (
+        f"sampled std {out.std().item():.3g} vs real {real_std:.3g}: the sampler "
+        f"is blowing up again"
+    )
 
 
 # --- EMA ------------------------------------------------------------------

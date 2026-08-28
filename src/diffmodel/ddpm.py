@@ -35,10 +35,16 @@ We do not know x_0 at sampling time, but the forward identity can be rearranged:
 
     x_0 = ( x_t - sqrt(1 - alphabar_t) * eps ) / sqrt(alphabar_t)
 
-so predicting eps is equivalent to predicting x_0, and substituting gives the
-mean the sampler actually uses:
+so predicting eps is equivalent to predicting x_0. Substituting the estimate
+into mu~ collapses it to the familiar epsilon-form line,
 
     mu_theta(x_t, t) = 1/sqrt(alpha_t) * ( x_t - beta_t/sqrt(1 - alphabar_t) * eps_theta(x_t, t) )
+
+but the sampler here keeps the substitution EXPLICIT — compute x0_hat, clamp it
+to the observed data range, feed it to mu~ — because x0_hat is the quantity with
+a physical bound and eps is not. See `p_sample_step` for why that clamp is the
+difference between an undertrained model failing bounded and failing by a factor
+of 6000.
 
 Ho et al. showed the variational bound reduces, up to a weighting the authors drop,
 to plain MSE between the true and predicted noise. That is the whole objective.
@@ -82,7 +88,14 @@ def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0.0001, 0.9999)
+    # Upper clip 0.999, per Nichol & Dhariwal §3.2 ("we clip beta_t to be no
+    # larger than 0.999 to prevent singularities at the end of the diffusion
+    # process"). The clip is not cosmetic: it bounds the reverse step's state
+    # gain 1/sqrt(alpha_t) at sqrt(1000) ~ 31.6. An earlier 0.9999 clip allowed
+    # alpha_t = 1e-4 — a 100x gain on the first reverse step at T=50, which
+    # amplified a merely-inaccurate epsilon prediction into a std ~1.9e3 sample
+    # explosion (RESEARCH.md Phase 4 correction).
+    return torch.clip(betas, 0.0001, 0.999)
 
 
 @dataclass
@@ -102,6 +115,14 @@ class DiffusionSchedule:
     sqrt_one_minus_alphas_cumprod: torch.Tensor
     sqrt_recip_alphas: torch.Tensor
     posterior_variance: torch.Tensor
+    # q(x_{t-1} | x_t, x0) mean = coef1 * x0 + coef2 * x_t  (Ho et al. eq. 7).
+    # Precomputed in float64 like everything else here, and for the same reason
+    # in a sharper form: coef1's denominator (1 - alphabar_t) is ~beta_0 ~ 1e-4
+    # at t=0, so computing it from the stored float32 alphabar loses ~4 decimal
+    # digits to cancellation — enough to break the epsilon-form equivalence the
+    # tests assert.
+    posterior_mean_coef1: torch.Tensor
+    posterior_mean_coef2: torch.Tensor
 
     @classmethod
     def build(cls, timesteps: int, kind: str = "linear", start: float = 1e-4, end: float = 0.02):
@@ -141,6 +162,8 @@ class DiffusionSchedule:
             # beta~_t. Element 0 is 0 by construction (alphabar_{-1} = 1), which is
             # correct: the final reverse step is deterministic.
             posterior_variance=f32(betas * (1.0 - acp_prev) / (1.0 - acp)),
+            posterior_mean_coef1=f32(betas * torch.sqrt(acp_prev) / (1.0 - acp)),
+            posterior_mean_coef2=f32((1.0 - acp_prev) * torch.sqrt(alphas) / (1.0 - acp)),
         )
 
     def to(self, device: torch.device) -> "DiffusionSchedule":
@@ -191,21 +214,80 @@ def p_losses(
     raise ValueError(f"unknown loss_type {loss_type!r}")
 
 
+def _randn(
+    shape: tuple[int, ...],
+    device: torch.device,
+    generator: torch.Generator | None = None,
+    like: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gaussian noise, from an explicit generator when one is supplied.
+
+    `generator=None` preserves the old process-global-RNG path exactly. With a
+    generator, the draw happens on the GENERATOR'S device and is then moved:
+    a CPU `torch.Generator` (which is what `seeding.torch_generator` returns)
+    cannot drive `randn` on an MPS/CUDA tensor. Determinism is the whole point
+    of the generator path, and the extra host->device copy is irrelevant at the
+    scale this project samples at.
+    """
+    dtype = like.dtype if like is not None else None
+    if generator is None:
+        return torch.randn(shape, device=device, dtype=dtype)
+    return torch.randn(shape, generator=generator, device=generator.device,
+                       dtype=dtype).to(device)
+
+
 @torch.no_grad()
 def p_sample_step(
-    model: nn.Module, x: torch.Tensor, t_index: int, sched: DiffusionSchedule
+    model: nn.Module,
+    x: torch.Tensor,
+    t_index: int,
+    sched: DiffusionSchedule,
+    x0_clamp: float | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """One reverse step, x_t -> x_{t-1}."""
-    t = torch.full((x.shape[0],), t_index, device=x.device, dtype=torch.long)
-    beta = _gather(sched.betas, t, x.ndim)
-    sqrt_omab = _gather(sched.sqrt_one_minus_alphas_cumprod, t, x.ndim)
-    sqrt_recip_a = _gather(sched.sqrt_recip_alphas, t, x.ndim)
+    """One reverse step, x_t -> x_{t-1}, in the x0-hat parameterisation.
 
-    mean = sqrt_recip_a * (x - beta / sqrt_omab * model(x, t))
+    Rather than the epsilon-form mean
+    `1/sqrt(alpha_t) * (x - beta_t/sqrt(1-alphabar_t) * eps_theta)`, this first
+    makes the model's implied clean image explicit,
+
+        x0_hat = (x - sqrt(1 - alphabar_t) * eps_theta) / sqrt(alphabar_t)
+
+    and feeds it to the true posterior mean q(x_{t-1} | x_t, x0) with its
+    standard coefficients (Ho et al. 2020, eq. 7):
+
+        c1 = beta_t * sqrt(alphabar_{t-1}) / (1 - alphabar_t)      # on x0_hat
+        c2 = (1 - alphabar_{t-1}) * sqrt(alpha_t) / (1 - alphabar_t)  # on x_t
+
+    Substituting x0_hat unclamped collapses c1/c2 back to the epsilon-form line
+    — `test_x0_form_step_equals_eps_form_when_unclamped` asserts that identity —
+    so with `x0_clamp=None` this is the SAME sampler, re-arranged.
+
+    The re-arrangement exists for the clamp. `x0_hat` is a statement about the
+    clean data, so it can be bounded by what clean data actually looks like:
+    clamping it to the observed image range is the `clip_denoised` safety net
+    every reference DDPM implementation carries, and the mechanism that stops a
+    merely-inaccurate epsilon predictor's error from compounding through the
+    chain's amplification (RESEARCH.md Phase 4 correction: unclamped SMOKE
+    samples reached std ~1.9e3 against a real 0.333). There is no principled way
+    to bound the epsilon-form mean directly — epsilon is legitimately N(0, I) —
+    which is why the parameterisation swap and the clamp arrive together.
+    """
+    t = torch.full((x.shape[0],), t_index, device=x.device, dtype=torch.long)
+    sqrt_ab = _gather(sched.sqrt_alphas_cumprod, t, x.ndim)
+    sqrt_omab = _gather(sched.sqrt_one_minus_alphas_cumprod, t, x.ndim)
+
+    x0_hat = (x - sqrt_omab * model(x, t)) / sqrt_ab
+    if x0_clamp is not None:
+        x0_hat = x0_hat.clamp(-x0_clamp, x0_clamp)
+
+    c1 = _gather(sched.posterior_mean_coef1, t, x.ndim)
+    c2 = _gather(sched.posterior_mean_coef2, t, x.ndim)
+    mean = c1 * x0_hat + c2 * x
     if t_index == 0:
         return mean  # final step is deterministic; beta~_0 = 0
     var = _gather(sched.posterior_variance, t, x.ndim)
-    return mean + torch.sqrt(var) * torch.randn_like(x)
+    return mean + torch.sqrt(var) * _randn(x.shape, x.device, generator, like=x)
 
 
 @torch.no_grad()
@@ -216,15 +298,26 @@ def sample(
     device: torch.device,
     return_trajectory: bool = False,
     progress: bool = False,
+    x0_clamp: float | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
     """Run the full reverse chain from pure noise.
+
+    `x0_clamp` bounds the implied clean image at every step — pass the preset's
+    `cfg.x0_clamp` (data-derived; see config.py) for any real sampling. None
+    reproduces the raw unclamped chain, kept reachable for the equivalence test
+    and for measuring how far an undertrained model diverges without the net.
+
+    `generator` makes the chain reproducible without touching process-global RNG
+    state — `seeding.torch_generator(label)` is the intended source. None
+    preserves the old global-RNG path.
 
     `return_trajectory` keeps ~12 evenly spaced intermediates for the denoising
     strip in the notebook — the picture that shows noise resolving into wavelet
     structure.
     """
     model.eval()
-    x = torch.randn(shape, device=device)
+    x = _randn(shape, device, generator)
     T = len(sched)
     keep = set(range(T - 1, -1, -max(1, T // 12))) | {0}
     traj: list[torch.Tensor] = []
@@ -236,7 +329,7 @@ def sample(
         steps = tqdm(steps, desc="sampling", total=T, leave=False)
 
     for i in steps:
-        x = p_sample_step(model, x, i, sched)
+        x = p_sample_step(model, x, i, sched, x0_clamp=x0_clamp, generator=generator)
         if return_trajectory and i in keep:
             traj.append(x.detach().cpu().clone())
 

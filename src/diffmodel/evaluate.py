@@ -132,9 +132,42 @@ def acf_within_day(x: np.ndarray, max_lag: int = 30) -> np.ndarray:
     return out
 
 
-def acf_abs_returns(series: np.ndarray, max_lag: int = 30) -> np.ndarray:
-    """ACF of |returns| — the volatility-clustering signature."""
-    return acf_within_day(np.abs(series[:, RET]), max_lag)
+def acf_abs_returns(
+    series: np.ndarray,
+    max_lag: int = 30,
+    deseasonalize: bool = True,
+    profile: np.ndarray | None = None,
+) -> np.ndarray:
+    """ACF of |returns| — the volatility-clustering signature.
+
+    Deseasonalised by default, because the raw quantity is mostly not
+    clustering: `acf_within_day` de-means each 78-bar day by a scalar and leaves
+    the bar-of-day profile in, and the deterministic U-shape dominates the
+    result — on the real reference split it is 84% of the RMS over 30 lags
+    (RESEARCH.md Phase 5, "Correction: acf_abs_l2 is mostly the intraday
+    profile"). Dividing each day's |r| by the bar-of-day |r| profile removes the
+    seasonal and leaves the thing the name claims to measure.
+
+    `profile` is the (78,) bar-of-day |r| profile to divide by. When None it is
+    estimated from `series` itself via `intraday_profile` — correct ONLY when
+    `series` is the reference data. When scoring a generator, pass the REAL
+    reference profile: deseasonalising synthetic data by its own profile would
+    hand every generator its own seasonality (the same leak class as fitting a
+    baseline on the data it is scored against). `StylizedFacts.measure` threads
+    this through as `deseasonal_profile`.
+
+    `deseasonalize=False` is the raw variant, kept reachable so the Phase 5
+    ablation ("how much of the raw ACF is the U-shape?") stays reproducible.
+    """
+    abs_r = np.abs(series[:, RET])
+    if deseasonalize:
+        if profile is None:
+            profile = intraday_profile(series, RET, absolute=True)
+        abs_r = np.divide(
+            abs_r, profile[None, :],
+            out=np.zeros_like(abs_r), where=profile[None, :] > 0,
+        )
+    return acf_within_day(abs_r, max_lag)
 
 
 def acf_returns(series: np.ndarray, max_lag: int = 30) -> np.ndarray:
@@ -254,8 +287,25 @@ class StylizedFacts:
     agg_kurtosis: dict[int, float]
 
     @classmethod
-    def measure(cls, series: np.ndarray, max_lag: int = 30) -> "StylizedFacts":
-        acf_a = acf_abs_returns(series, max_lag)
+    def measure(
+        cls,
+        series: np.ndarray,
+        max_lag: int = 30,
+        deseasonal_profile: np.ndarray | None = None,
+    ) -> "StylizedFacts":
+        """Measure one dataset. `acf_abs` / `acf_decay` are DESEASONALISED.
+
+        `deseasonal_profile` is the bar-of-day |r| profile divided out before
+        the |r| ACF. It is threaded as an argument, rather than always derived
+        from `series`, because the profile must come from the REAL reference
+        data no matter whose series is being measured: real and synthetic must
+        be deseasonalised by the SAME (real) profile, or every generator gets
+        its own seasonality divided out and the metric stops penalising a wrong
+        U-shape's leakage into the ACF. None = derive from `series`, which is
+        only correct when `series` IS the reference data (or when no reference
+        exists yet). `scorecard` passes the real profile for every generator.
+        """
+        acf_a = acf_abs_returns(series, max_lag, profile=deseasonal_profile)
         within = standardize_per_day(series)
         return cls(
             tail_index=hill_tail_index(series[:, RET]),
@@ -314,6 +364,15 @@ def scorecard(real: np.ndarray, generators: dict[str, np.ndarray]) -> "object":
     """One row per generator. Returns a pandas DataFrame."""
     import pandas as pd
 
-    rf = StylizedFacts.measure(real)
-    rows = {name: compare(rf, StylizedFacts.measure(s)) for name, s in generators.items()}
+    # The deseasonalising profile is the REAL one, for every row. Letting each
+    # generator divide out its own bar-of-day |r| profile would hand it its own
+    # seasonality for free: a generator with a badly wrong U-shape would have
+    # that wrongness cancelled out of acf_abs_l2 instead of showing up in it.
+    # One profile, taken from the reference, keeps the column comparable.
+    rp = intraday_profile(real, RET, absolute=True)
+    rf = StylizedFacts.measure(real, deseasonal_profile=rp)
+    rows = {
+        name: compare(rf, StylizedFacts.measure(s, deseasonal_profile=rp))
+        for name, s in generators.items()
+    }
     return pd.DataFrame(rows).T

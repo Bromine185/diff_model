@@ -66,6 +66,13 @@ class Config:
     beta_schedule: str          # "linear" | "cosine"
     beta_start: float = 1e-4
     beta_end: float = 0.02
+    # Sampling-time clamp on the implied clean image x0_hat (ddpm.p_sample_step).
+    # DATA-DERIVED, not tuned: the fit-split images span ±6.35 (99.99% of |x| is
+    # within ±3.50, measured via prepare(get_config("SMOKE"))), so 6.5 admits
+    # every observed pixel with margin while bounding the reverse chain's error
+    # amplification — the safety net ("clip_denoised") every reference DDPM
+    # carries. None disables it (the ablation / equivalence-test path).
+    x0_clamp: float | None = 6.5
 
     # unet
     base_channels: int = 128
@@ -114,6 +121,10 @@ SMOKE = Config(
     # trained on. The cosine schedule defines alphabar directly and reaches ~0 at
     # any T. `test_short_schedule_warns_that_it_never_reaches_noise` pins this.
     beta_schedule="cosine",
+    # Data-derived (see the field comment on Config): fit-split images span
+    # ±6.35, so 6.5 covers everything real while stopping the T=50 cosine
+    # chain's error amplification from compounding unbounded.
+    x0_clamp=6.5,
     base_channels=32,
     channel_mults=(1, 2, 4),
     num_res_blocks=1,
@@ -135,6 +146,10 @@ FULL = Config(
     val_sessions=10,
     timesteps=1000,
     beta_schedule="linear",
+    # Same data-derived bound as SMOKE. FULL's linear T=1000 chain cannot blow
+    # up the way SMOKE's did (max 1/sqrt(alpha_t) = 1.010), but the safety net
+    # is standard practice and costs nothing when it never binds.
+    x0_clamp=6.5,
     base_channels=128,
     channel_mults=(1, 2, 4),   # 128 -> 256 -> 512, matching the paper's widths
     num_res_blocks=2,
